@@ -15,9 +15,11 @@ public class Protocol {
     public static final byte MSG_DONE      = 0x05;
     public static final byte MSG_FAILED    = 0x06;
     public static final byte MSG_TASK      = 0x07;
+    public static final byte MSG_WAIT      = 0x08;
     public static final byte MSG_HEARTBEAT = 0x09;
     public static final byte MSG_PONG      = 0x0A;
     public static final byte MSG_STATS     = 0x0B;
+    public static final byte MSG_STATS_RESPONSE = 0x0C;
 
     private final DataInputStream  in;
     private final DataOutputStream out;

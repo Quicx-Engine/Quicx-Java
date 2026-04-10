@@ -1,0 +1,7 @@
+dev/quicx/QuicxWorker.class
+dev/quicx/internal/Protocol$Message.class
+dev/quicx/QuicxException.class
+dev/quicx/internal/Connection.class
+dev/quicx/QuicxClient.class
+dev/quicx/internal/Protocol.class
+dev/quicx/QuicxWorker$TaskHandler.class
