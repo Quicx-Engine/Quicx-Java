@@ -4,13 +4,18 @@ plugins {
 }
 
 group   = 'dev.quicx'
-version = '1.0.0'
+version = '2.0.0'
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_11
-    targetCompatibility = JavaVersion.VERSION_11
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
     withSourcesJar()
     withJavadocJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 11
 }
 
 repositories {
@@ -18,7 +23,23 @@ repositories {
 }
 
 dependencies {
-    // no external dependencies — pure Java
+    // the library itself has no dependencies; JUnit is for the tests only
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+}
+
+jar {
+    manifest {
+        attributes('Automatic-Module-Name': 'dev.quicx.client')
+    }
+}
+
+javadoc {
+    exclude 'dev/quicx/internal/**'
 }
 
 publishing {

@@ -1,49 +1,391 @@
 package dev.quicx;
 
-import dev.quicx.internal.Connection;
-import dev.quicx.internal.Protocol;
+import dev.quicx.internal.Frame;
+import dev.quicx.internal.Qxp;
 
-public class QuicxClient implements AutoCloseable {
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
-    private final Connection conn;
+/**
+ * Submits tasks to quicxd.
+ *
+ * <p>One client keeps one TCP connection open and reuses it for every
+ * submit; if the connection breaks, the next call opens a new one. It is
+ * safe to share one client between threads, and cheaper than creating one
+ * per task.
+ *
+ * <pre>{@code
+ * try (QuicxClient client = new QuicxClient("localhost", 16381)) {
+ *     int id = client.submit("send_email", "{\"to\":\"ana@example.com\"}");
+ *
+ *     TaskResult r = client.submitAndWait("resize", imageBytes, Duration.ofSeconds(30));
+ *     if (r.isFailed()) log(r.failureReason().get());
+ * }
+ * }</pre>
+ *
+ * <p>Errors are unchecked: {@link QuicxRejectedException} when quicxd says
+ * no (its memory budget is full, for instance), {@link QuicxConnectionException}
+ * when it cannot be reached, and {@link IllegalArgumentException} for a task
+ * type or payload that QXP cannot carry.
+ */
+public final class QuicxClient implements AutoCloseable {
 
+    /** The port quicxd listens on unless configured otherwise. */
+    public static final int DEFAULT_PORT = 16381;
+
+    private final String host;
+    private final int port;
+    private final int connectTimeoutMs;
+    private final long responseTimeoutMs;
+
+    private final Object writeLock = new Object();   // one writer at a time; keeps sends in queue order
+    private final Object stateLock = new Object();   // guards everything below
+
+    private Socket socket;
+    private OutputStream out;
+    private final ArrayDeque<Pending> awaitingAnswer = new ArrayDeque<>();
+    private final Map<Integer, CompletableFuture<TaskResult>> awaitingResult = new HashMap<>();
+    private boolean closed;
+
+    /** A client for quicxd at {@code host:port}, with default timeouts. */
     public QuicxClient(String host, int port) {
-        this.conn = new Connection(host, port);
+        this(builder().host(host).port(port));
     }
 
-    // submit a task — returns task ID
-    public int submit(String taskType,
-                      byte[] payload) throws Exception {
-        conn.connect();
+    private QuicxClient(Builder b) {
+        this.host = b.host;
+        this.port = b.port;
+        this.connectTimeoutMs = (int) Math.min(Integer.MAX_VALUE, b.connectTimeout.toMillis());
+        this.responseTimeoutMs = b.responseTimeout.toMillis();
+    }
+
+    /** Starts a builder for a client with non-default settings. */
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    // ---- submitting --------------------------------------------------------
+
+    /**
+     * Submits a task and returns the id quicxd gave it, once quicxd has
+     * queued it. Does not wait for a worker.
+     *
+     * @param taskType 1 to 31 bytes of UTF-8, the type workers register for
+     * @param payload  the task's data; with the type it must fit in 1,024 bytes
+     * @return the task id
+     * @throws QuicxRejectedException   if quicxd refused the task, e.g. because its memory budget is full
+     * @throws QuicxConnectionException if quicxd could not be reached or did not answer in time
+     */
+    public int submit(String taskType, byte[] payload) {
+        Pending p = send(taskType, payload, false);
+        return await(p);
+    }
+
+    /** {@link #submit(String, byte[])} with the payload encoded as UTF-8. */
+    public int submit(String taskType, String payload) {
+        return submit(taskType, utf8(payload));
+    }
+
+    /**
+     * Submits a task and returns a future that completes when a worker
+     * reports it DONE or FAILED. The future fails with
+     * {@link QuicxRejectedException} if quicxd refuses the task and with
+     * {@link QuicxConnectionException} if the connection breaks before the
+     * result arrives.
+     */
+    public CompletableFuture<TaskResult> submitAsync(String taskType, byte[] payload) {
+        return send(taskType, payload, true).result;
+    }
+
+    /** {@link #submitAsync(String, byte[])} with the payload encoded as UTF-8. */
+    public CompletableFuture<TaskResult> submitAsync(String taskType, String payload) {
+        return submitAsync(taskType, utf8(payload));
+    }
+
+    /**
+     * Submits a task and blocks until a worker reports it DONE or FAILED.
+     *
+     * @param timeout how long to wait for the result
+     * @throws QuicxException if no result arrives within {@code timeout}
+     */
+    public TaskResult submitAndWait(String taskType, byte[] payload, Duration timeout) {
+        Objects.requireNonNull(timeout, "timeout");
+        CompletableFuture<TaskResult> f = submitAsync(taskType, payload);
         try {
-            conn.protocol().sendSubmit(taskType, payload);
-
-            Protocol.Message response =
-                conn.protocol().readMessage();
-
-            if (response.type == Protocol.MSG_OK)
-                return response.taskId;
-
-            if (response.type == Protocol.MSG_ERROR)
-                throw new QuicxException(
-                    "task rejected: " + response.errorMsg);
-
-            throw new QuicxException(
-                "unexpected response: " + response.type);
-        } finally {
-            conn.close();  // one connection per submit — stateless
+            return f.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            throw new QuicxException("no result within " + timeout.toMillis() + " ms");
+        } catch (ExecutionException e) {
+            throw unwrap(e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new QuicxException("interrupted while waiting for the result", e);
         }
     }
 
-    // convenience — string payload
-    public int submit(String taskType,
-                      String payload) throws Exception {
-        return submit(taskType,
-                      payload.getBytes("UTF-8"));
+    /** {@link #submitAndWait(String, byte[], Duration)} with the payload encoded as UTF-8. */
+    public TaskResult submitAndWait(String taskType, String payload, Duration timeout) {
+        return submitAndWait(taskType, utf8(payload), timeout);
     }
 
+    /** The host this client connects to. */
+    public String host() {
+        return host;
+    }
+
+    /** The port this client connects to. */
+    public int port() {
+        return port;
+    }
+
+    /**
+     * Closes the connection. Submits that are still waiting fail with
+     * {@link QuicxConnectionException}. Calling it twice does nothing.
+     */
     @Override
     public void close() {
-        conn.close();
+        synchronized (stateLock) {
+            closed = true;
+        }
+        drop(null, "the client was closed");
+    }
+
+    // ---- sending -----------------------------------------------------------
+
+    private static final class Pending {
+        final boolean wantResult;
+        final CompletableFuture<Integer> accepted = new CompletableFuture<>();
+        final CompletableFuture<TaskResult> result = new CompletableFuture<>();
+
+        Pending(boolean wantResult) {
+            this.wantResult = wantResult;
+        }
+
+        void fail(Throwable t) {
+            accepted.completeExceptionally(t);
+            result.completeExceptionally(t);
+        }
+    }
+
+    private Pending send(String taskType, byte[] payload, boolean wantResult) {
+        byte[] body = Qxp.submitBody(taskType, payload);   // checks sizes before anything is sent
+        Pending p = new Pending(wantResult);
+        synchronized (writeLock) {
+            OutputStream o = connection();
+            synchronized (stateLock) {
+                awaitingAnswer.addLast(p);
+            }
+            try {
+                Qxp.writeFrame(o, Qxp.SUBMIT, body);
+            } catch (IOException e) {
+                drop(e, "sending to quicxd at " + host + ":" + port + " failed");
+            }
+        }
+        return p;
+    }
+
+    private int await(Pending p) {
+        try {
+            return p.accepted.get(responseTimeoutMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            // the answers on this connection can no longer be matched to requests
+            drop(e, "quicxd did not answer within " + responseTimeoutMs + " ms");
+            throw new QuicxConnectionException("quicxd at " + host + ":" + port + " did not answer within "
+                    + responseTimeoutMs + " ms; the task may or may not have been queued", e);
+        } catch (ExecutionException e) {
+            throw unwrap(e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new QuicxException("interrupted while waiting for quicxd", e);
+        }
+    }
+
+    /** The open connection, opening one if needed. Called with writeLock held. */
+    private OutputStream connection() {
+        synchronized (stateLock) {
+            if (closed) throw new QuicxException("the client is closed");
+            if (socket != null) return out;
+        }
+        Socket s = new Socket();
+        InputStream in;
+        OutputStream o;
+        try {
+            s.setTcpNoDelay(true);
+            s.setKeepAlive(true);
+            s.connect(new InetSocketAddress(host, port), connectTimeoutMs);
+            in = new BufferedInputStream(s.getInputStream());
+            o = new BufferedOutputStream(s.getOutputStream());
+        } catch (IOException e) {
+            closeQuietly(s);
+            throw new QuicxConnectionException("cannot connect to quicxd at " + host + ":" + port, e);
+        }
+        synchronized (stateLock) {
+            if (closed) {
+                closeQuietly(s);
+                throw new QuicxException("the client is closed");
+            }
+            socket = s;
+            out = o;
+        }
+        Thread reader = new Thread(() -> readLoop(s, in), "quicx-client " + host + ":" + port);
+        reader.setDaemon(true);
+        reader.start();
+        return o;
+    }
+
+    // ---- receiving ---------------------------------------------------------
+
+    private void readLoop(Socket s, InputStream in) {
+        try {
+            while (true) {
+                Frame f = Qxp.readFrame(in);
+                switch (f.type) {
+                    case Qxp.OK:     onOk(Qxp.getInt(f.body, 0)); break;
+                    case Qxp.ERROR:  onError(f.body); break;
+                    case Qxp.DONE:   onResult(Qxp.getInt(f.body, 0), null); break;
+                    case Qxp.FAILED: onResult(Qxp.getInt(f.body, 0), Qxp.utf8(f.body, 4, f.body.length - 4)); break;
+                    default:         break;   // PONG, WAIT and anything newer: nothing to do
+                }
+            }
+        } catch (IOException | RuntimeException e) {
+            synchronized (stateLock) {
+                if (socket != s) return;   // already replaced or closed
+            }
+            drop(e, "the connection to quicxd at " + host + ":" + port + " was lost");
+        }
+    }
+
+    private void onOk(int taskId) {
+        Pending p;
+        synchronized (stateLock) {
+            p = awaitingAnswer.pollFirst();
+            if (p == null) return;
+            // DONE for this id can only arrive after this OK, and this thread reads both in order
+            if (p.wantResult) awaitingResult.put(taskId, p.result);
+        }
+        p.accepted.complete(taskId);
+    }
+
+    private void onError(byte[] body) {
+        ErrorCode code = body.length > 0 ? ErrorCode.of(body[0] & 0xFF) : ErrorCode.UNKNOWN;
+        String reason = body.length > 1 ? Qxp.utf8(body, 1, body.length - 1) : "";
+        Pending p;
+        synchronized (stateLock) {
+            p = awaitingAnswer.pollFirst();
+        }
+        if (p != null) p.fail(new QuicxRejectedException(code, reason));
+    }
+
+    private void onResult(int taskId, String failureReason) {
+        CompletableFuture<TaskResult> f;
+        synchronized (stateLock) {
+            f = awaitingResult.remove(taskId);
+        }
+        if (f != null) f.complete(failureReason == null ? TaskResult.done(taskId) : TaskResult.failed(taskId, failureReason));
+    }
+
+    /** Closes the current connection and fails everything still waiting on it. */
+    private void drop(Throwable cause, String why) {
+        Socket s;
+        List<Pending> pending;
+        List<CompletableFuture<TaskResult>> results;
+        synchronized (stateLock) {
+            s = socket;
+            socket = null;
+            out = null;
+            pending = new ArrayList<>(awaitingAnswer);
+            awaitingAnswer.clear();
+            results = new ArrayList<>(awaitingResult.values());
+            awaitingResult.clear();
+        }
+        closeQuietly(s);
+        if (pending.isEmpty() && results.isEmpty()) return;
+        QuicxConnectionException e = new QuicxConnectionException(why, cause);
+        for (Pending p : pending) p.fail(e);
+        for (CompletableFuture<TaskResult> r : results) r.completeExceptionally(e);
+    }
+
+    // ---- helpers -----------------------------------------------------------
+
+    private static QuicxException unwrap(ExecutionException e) {
+        Throwable c = e.getCause();
+        if (c instanceof QuicxException) return (QuicxException) c;
+        return new QuicxException(String.valueOf(c), c);
+    }
+
+    private static byte[] utf8(String s) {
+        return s == null ? new byte[0] : s.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static void closeQuietly(Socket s) {
+        if (s == null) return;
+        try {
+            s.close();
+        } catch (IOException ignored) {
+            // nothing useful to do
+        }
+    }
+
+    /** Settings for a {@link QuicxClient}. */
+    public static final class Builder {
+        private String host = "localhost";
+        private int port = DEFAULT_PORT;
+        private Duration connectTimeout = Duration.ofSeconds(5);
+        private Duration responseTimeout = Duration.ofSeconds(10);
+
+        private Builder() {}
+
+        /** Host name or address of quicxd. Default {@code localhost}. */
+        public Builder host(String host) {
+            this.host = Objects.requireNonNull(host, "host");
+            return this;
+        }
+
+        /** Port of quicxd. Default {@value QuicxClient#DEFAULT_PORT}. */
+        public Builder port(int port) {
+            if (port < 1 || port > 65535) throw new IllegalArgumentException("port must be 1-65535, not " + port);
+            this.port = port;
+            return this;
+        }
+
+        /** How long opening the connection may take. Default 5 seconds. */
+        public Builder connectTimeout(Duration timeout) {
+            this.connectTimeout = positive(timeout, "connectTimeout");
+            return this;
+        }
+
+        /** How long {@link QuicxClient#submit} waits for quicxd to accept a task. Default 10 seconds. */
+        public Builder responseTimeout(Duration timeout) {
+            this.responseTimeout = positive(timeout, "responseTimeout");
+            return this;
+        }
+
+        /** Creates the client. It connects on the first submit. */
+        public QuicxClient build() {
+            return new QuicxClient(this);
+        }
+
+        static Duration positive(Duration d, String name) {
+            Objects.requireNonNull(d, name);
+            if (d.isNegative() || d.isZero()) throw new IllegalArgumentException(name + " must be positive");
+            return d;
+        }
     }
 }
