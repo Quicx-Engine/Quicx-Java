@@ -1,0 +1,45 @@
+name: API docs
+
+# Publishes the Javadoc to GitHub Pages (https://quicx-engine.github.io/Quicx-Java/)
+# on every push to main. It runs once Pages is enabled with "GitHub Actions" as
+# the source and the repository variable PAGES_ENABLED is set to true.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: vars.PAGES_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: maven
+      - run: mvn -B -f quicx-java/pom.xml javadoc:javadoc
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: quicx-java/target/site/apidocs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -2,6 +2,7 @@
 
 [![Maven Central](https://img.shields.io/maven-central/v/dev.quicx/quicx-client?label=Maven%20Central)](https://central.sonatype.com/artifact/dev.quicx/quicx-client)
 [![CI](https://github.com/Quicx-Engine/Quicx-Java/actions/workflows/ci.yml/badge.svg)](https://github.com/Quicx-Engine/Quicx-Java/actions/workflows/ci.yml)
+[![Javadoc](https://javadoc.io/badge2/dev.quicx/quicx-client/javadoc.svg)](https://javadoc.io/doc/dev.quicx/quicx-client)
 [![Java 11+](https://img.shields.io/badge/Java-11%2B-blue)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -201,6 +202,7 @@ The jar's module name is `dev.quicx.client`.
 
 - Quicx, the daemon: [github.com/anastassow/Quicx](https://github.com/anastassow/Quicx), [quicx.dev](https://quicx.dev)
 - This library's documentation: [quicx.dev/docs/java-client](https://quicx.dev/docs/java-client)
+- API reference (Javadoc): [javadoc.io/doc/dev.quicx/quicx-client](https://javadoc.io/doc/dev.quicx/quicx-client)
 - QXP, the protocol: [quicx.dev/docs/binary-protocol](https://quicx.dev/docs/binary-protocol)
 - Changes: [CHANGELOG.md](CHANGELOG.md)
 
