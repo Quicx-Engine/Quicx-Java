@@ -5,9 +5,9 @@ public enum ErrorCode {
 
     /** The memory budget is used up (or, after READY, the worker pool is full). Try again later. */
     QUEUE_FULL(0x01),
-    /** The frame could not be parsed. */
+    /** The frame could not be parsed: also a value level above 15, or SUBMIT_VALUED sent to quicxd older than 2.1. */
     INVALID_MESSAGE(0x02),
-    /** The body was larger than 1,024 bytes. */
+    /** The body was larger than quicxd accepts: 1,024 bytes unless it was built with a larger MAX_PAYLOAD. */
     PAYLOAD_TOO_BIG(0x03),
     /** The message type is not one the daemon knows. */
     UNKNOWN_TYPE(0x04),

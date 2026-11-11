@@ -37,6 +37,11 @@ import java.util.concurrent.TimeoutException;
  *
  *     TaskResult r = client.submitAndWait("resize", imageBytes, Duration.ofSeconds(30));
  *     if (r.isFailed()) log(r.failureReason().get());
+ *
+ *     // quicxd 2.1+: a value level from 0 to 15; when the budget is full, a
+ *     // more valuable task can push out a less valuable one that is waiting
+ *     client.submit("frame", frameRef, 12);
+ *     client.submit("stop", "", QuicxClient.CRITICAL_LEVEL);   // never evicted
  * }
  * }</pre>
  *
@@ -50,10 +55,17 @@ public final class QuicxClient implements AutoCloseable {
     /** The port quicxd listens on unless configured otherwise. */
     public static final int DEFAULT_PORT = 16381;
 
+    /** The value level quicxd gives a task submitted without one. */
+    public static final int DEFAULT_LEVEL = Qxp.DEFAULT_LEVEL;
+
+    /** The highest value level; quicxd never evicts a task of this level. */
+    public static final int CRITICAL_LEVEL = Qxp.MAX_LEVEL;
+
     private final String host;
     private final int port;
     private final int connectTimeoutMs;
     private final long responseTimeoutMs;
+    private final int maxBody;
 
     private final Object writeLock = new Object();   // one writer at a time; keeps sends in queue order
     private final Object stateLock = new Object();   // guards everything below
@@ -74,6 +86,7 @@ public final class QuicxClient implements AutoCloseable {
         this.port = b.port;
         this.connectTimeoutMs = (int) Math.min(Integer.MAX_VALUE, b.connectTimeout.toMillis());
         this.responseTimeoutMs = b.responseTimeout.toMillis();
+        this.maxBody = b.maxBody;
     }
 
     /** Starts a builder for a client with non-default settings. */
@@ -94,8 +107,30 @@ public final class QuicxClient implements AutoCloseable {
      * @throws QuicxConnectionException if quicxd could not be reached or did not answer in time
      */
     public int submit(String taskType, byte[] payload) {
-        Pending p = send(taskType, payload, false);
+        Pending p = send(taskType, payload, -1, false);
         return await(p);
+    }
+
+    /**
+     * Submits a task with a value level and returns its id once quicxd has
+     * queued it. Higher levels are handed to workers first. When quicxd's
+     * memory budget is full, a task can push out a waiting task of a lower
+     * level, whose producer then gets a result with
+     * {@link TaskResult#isEvicted()}; level {@value #CRITICAL_LEVEL} is never
+     * evicted. Needs quicxd 2.1.0 or later; an older quicxd refuses it with
+     * {@link ErrorCode#INVALID_MESSAGE}.
+     *
+     * @param level 0 (least valuable) to 15 (critical); a plain {@link #submit(String, byte[])} is level {@value #DEFAULT_LEVEL}
+     * @throws IllegalArgumentException if the level is outside 0-15
+     */
+    public int submit(String taskType, byte[] payload, int level) {
+        Pending p = send(taskType, payload, Qxp.checkLevel(level), false);
+        return await(p);
+    }
+
+    /** {@link #submit(String, byte[], int)} with the payload encoded as UTF-8. */
+    public int submit(String taskType, String payload, int level) {
+        return submit(taskType, utf8(payload), level);
     }
 
     /** {@link #submit(String, byte[])} with the payload encoded as UTF-8. */
@@ -111,7 +146,22 @@ public final class QuicxClient implements AutoCloseable {
      * result arrives.
      */
     public CompletableFuture<TaskResult> submitAsync(String taskType, byte[] payload) {
-        return send(taskType, payload, true).result;
+        return send(taskType, payload, -1, true).result;
+    }
+
+    /**
+     * {@link #submitAsync(String, byte[])} with a value level (see
+     * {@link #submit(String, byte[], int)}). If quicxd evicts the task to
+     * make room for a more valuable one, the future completes with a result
+     * for which {@link TaskResult#isEvicted()} is true.
+     */
+    public CompletableFuture<TaskResult> submitAsync(String taskType, byte[] payload, int level) {
+        return send(taskType, payload, Qxp.checkLevel(level), true).result;
+    }
+
+    /** {@link #submitAsync(String, byte[], int)} with the payload encoded as UTF-8. */
+    public CompletableFuture<TaskResult> submitAsync(String taskType, String payload, int level) {
+        return submitAsync(taskType, utf8(payload), level);
     }
 
     /** {@link #submitAsync(String, byte[])} with the payload encoded as UTF-8. */
@@ -126,8 +176,23 @@ public final class QuicxClient implements AutoCloseable {
      * @throws QuicxException if no result arrives within {@code timeout}
      */
     public TaskResult submitAndWait(String taskType, byte[] payload, Duration timeout) {
+        Objects.requireNonNull(timeout, "timeout");   // before anything is sent
+        return waitFor(submitAsync(taskType, payload), timeout);
+    }
+
+    /** {@link #submitAndWait(String, byte[], Duration)} with a value level (see {@link #submit(String, byte[], int)}). */
+    public TaskResult submitAndWait(String taskType, byte[] payload, int level, Duration timeout) {
         Objects.requireNonNull(timeout, "timeout");
-        CompletableFuture<TaskResult> f = submitAsync(taskType, payload);
+        return waitFor(submitAsync(taskType, payload, level), timeout);
+    }
+
+    /** {@link #submitAndWait(String, byte[], int, Duration)} with the payload encoded as UTF-8. */
+    public TaskResult submitAndWait(String taskType, String payload, int level, Duration timeout) {
+        return submitAndWait(taskType, utf8(payload), level, timeout);
+    }
+
+    private static TaskResult waitFor(CompletableFuture<TaskResult> f, Duration timeout) {
+        Objects.requireNonNull(timeout, "timeout");
         try {
             return f.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
@@ -153,6 +218,11 @@ public final class QuicxClient implements AutoCloseable {
     /** The port this client connects to. */
     public int port() {
         return port;
+    }
+
+    /** The largest QXP body this client sends: 1,024 bytes unless set with {@link Builder#maxBody(int)}. */
+    public int maxBody() {
+        return maxBody;
     }
 
     /**
@@ -184,8 +254,12 @@ public final class QuicxClient implements AutoCloseable {
         }
     }
 
-    private Pending send(String taskType, byte[] payload, boolean wantResult) {
-        byte[] body = Qxp.submitBody(taskType, payload);   // checks sizes before anything is sent
+    /** level -1 sends a plain SUBMIT, 0-15 a SUBMIT_VALUED. */
+    private Pending send(String taskType, byte[] payload, int level, boolean wantResult) {
+        // checks the type, level and size before anything is sent
+        byte[] body = level < 0 ? Qxp.submitBody(taskType, payload, maxBody)
+                                : Qxp.valuedSubmitBody(level, taskType, payload, maxBody);
+        byte frameType = level < 0 ? Qxp.SUBMIT : Qxp.SUBMIT_VALUED;
         Pending p = new Pending(wantResult);
         synchronized (writeLock) {
             OutputStream o = connection();
@@ -193,7 +267,7 @@ public final class QuicxClient implements AutoCloseable {
                 awaitingAnswer.addLast(p);
             }
             try {
-                Qxp.writeFrame(o, Qxp.SUBMIT, body);
+                Qxp.writeFrame(o, frameType, body);
             } catch (IOException e) {
                 drop(e, "sending to quicxd at " + host + ":" + port + " failed");
             }
@@ -349,6 +423,7 @@ public final class QuicxClient implements AutoCloseable {
         private int port = DEFAULT_PORT;
         private Duration connectTimeout = Duration.ofSeconds(5);
         private Duration responseTimeout = Duration.ofSeconds(10);
+        private int maxBody = Qxp.MAX_BODY;
 
         private Builder() {}
 
@@ -374,6 +449,18 @@ public final class QuicxClient implements AutoCloseable {
         /** How long {@link QuicxClient#submit} waits for quicxd to accept a task. Default 10 seconds. */
         public Builder responseTimeout(Duration timeout) {
             this.responseTimeout = positive(timeout, "responseTimeout");
+            return this;
+        }
+
+        /**
+         * The largest QXP body quicxd accepts: 1,024 bytes by default, or N for a
+         * daemon built with {@code make MAX_PAYLOAD=N}. The client refuses larger
+         * tasks before sending them. At most {@value Qxp#MAX_BODY_LIMIT}.
+         */
+        public Builder maxBody(int bytes) {
+            if (bytes < 16 || bytes > Qxp.MAX_BODY_LIMIT)
+                throw new IllegalArgumentException("maxBody must be 16-" + Qxp.MAX_BODY_LIMIT + ", not " + bytes);
+            this.maxBody = bytes;
             return this;
         }
 

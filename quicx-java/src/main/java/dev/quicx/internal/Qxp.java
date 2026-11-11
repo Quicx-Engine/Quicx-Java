@@ -27,11 +27,26 @@ public final class Qxp {
     public static final byte WAIT      = 0x08;
     public static final byte HEARTBEAT = 0x09;
     public static final byte PONG      = 0x0A;
+    /** A SUBMIT with a value level in front of the body (quicxd 2.1.0 and later). */
+    public static final byte SUBMIT_VALUED = 0x0D;
+
+    /** Value levels: 0 is the least valuable, 15 is critical and never evicted. */
+    public static final int MIN_LEVEL = 0;
+    public static final int MAX_LEVEL = 15;
+    /** The level quicxd gives a plain SUBMIT. */
+    public static final int DEFAULT_LEVEL = 8;
 
     public static final int HEADER_SIZE = 6;
 
-    /** Largest body quicxd accepts (PROTOCOL_MAX_PAYLOAD in protocol.h). */
+    /**
+     * Largest body a default quicxd accepts (PROTOCOL_MAX_PAYLOAD in protocol.h).
+     * A daemon built with {@code make MAX_PAYLOAD=N} accepts N; the client's
+     * {@code maxBody} setting matches it.
+     */
     public static final int MAX_BODY = 1024;
+
+    /** Largest body any quicxd build accepts: a 64-byte record plus the body must fit a 16 KiB page. */
+    public static final int MAX_BODY_LIMIT = 16_320;
 
     /** Longest task type in bytes (PROTOCOL_MAX_TYPE_LEN minus the terminating zero). */
     public static final int MAX_TYPE_BYTES = 31;
@@ -89,17 +104,48 @@ public final class Qxp {
      * @throws IllegalArgumentException if the type is invalid or the body would exceed {@link #MAX_BODY}
      */
     public static byte[] submitBody(String taskType, byte[] payload) {
+        return submitBody(taskType, payload, MAX_BODY);
+    }
+
+    /** {@link #submitBody(String, byte[])} for a daemon that accepts bodies of up to {@code maxBody} bytes. */
+    public static byte[] submitBody(String taskType, byte[] payload, int maxBody) {
+        return body(-1, taskType, payload, maxBody);
+    }
+
+    /**
+     * The body of a SUBMIT_VALUED: [level:1][type length:1][type][payload].
+     * The level byte counts toward the daemon's body limit.
+     *
+     * @throws IllegalArgumentException if the level is outside 0-15, the type is invalid or the body is too large
+     */
+    public static byte[] valuedSubmitBody(int level, String taskType, byte[] payload, int maxBody) {
+        checkLevel(level);
+        return body(level, taskType, payload, maxBody);
+    }
+
+    /** @throws IllegalArgumentException unless {@code level} is between {@link #MIN_LEVEL} and {@link #MAX_LEVEL} */
+    public static int checkLevel(int level) {
+        if (level < MIN_LEVEL || level > MAX_LEVEL)
+            throw new IllegalArgumentException("level must be " + MIN_LEVEL + "-" + MAX_LEVEL + ", not " + level);
+        return level;
+    }
+
+    private static byte[] body(int level, String taskType, byte[] payload, int maxBody) {
         byte[] type = typeBytes(taskType);
         int payloadLen = payload == null ? 0 : payload.length;
-        int len = 1 + type.length + payloadLen;
-        if (len > MAX_BODY) {
+        int head = level < 0 ? 1 : 2;   // [level] [type length]
+        int len = head + type.length + payloadLen;
+        if (len > maxBody) {
             throw new IllegalArgumentException("payload of " + payloadLen + " bytes is too large: with the task type '"
-                    + taskType + "' at most " + (MAX_BODY - 1 - type.length) + " bytes fit in one QXP frame");
+                    + taskType + "' at most " + (maxBody - head - type.length) + " bytes fit in one QXP frame of "
+                    + maxBody + " bytes");
         }
         byte[] body = new byte[len];
-        body[0] = (byte) type.length;
-        System.arraycopy(type, 0, body, 1, type.length);
-        if (payloadLen > 0) System.arraycopy(payload, 0, body, 1 + type.length, payloadLen);
+        int off = 0;
+        if (level >= 0) body[off++] = (byte) level;
+        body[off++] = (byte) type.length;
+        System.arraycopy(type, 0, body, off, type.length);
+        if (payloadLen > 0) System.arraycopy(payload, 0, body, off + type.length, payloadLen);
         return body;
     }
 

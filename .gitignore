@@ -28,3 +28,8 @@ quicx-java/target/
 quicx-java/build/
 quicx-java/.gradle/
 .DS_Store
+
+# editors
+.vscode/
+.idea/
+*.iml

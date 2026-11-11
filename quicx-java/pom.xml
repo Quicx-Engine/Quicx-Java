@@ -6,13 +6,14 @@
 
   <groupId>dev.quicx</groupId>
   <artifactId>quicx-client</artifactId>
-  <version>2.0.0</version>
+  <version>2.1.0</version>
   <packaging>jar</packaging>
 
   <name>Quicx Java Client</name>
   <description>
-    Java client for Quicx, a task queue daemon with a hard memory limit: submit tasks,
-    wait for their results, and run workers over QXP, the Quicx Protocol.
+    Java client for Quicx, a task queue daemon with a hard memory limit that keeps the most
+    valuable work when it is full: submit tasks with value levels, wait for their results,
+    and run workers over QXP, the Quicx Protocol.
   </description>
   <url>https://quicx.dev</url>
 

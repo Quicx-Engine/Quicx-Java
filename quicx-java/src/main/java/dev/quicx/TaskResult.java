@@ -36,13 +36,28 @@ public final class TaskResult {
         return failureReason != null;
     }
 
-    /** The worker's reason (at most 63 bytes), if it reported FAILED. */
+    /**
+     * True if quicxd evicted the task before any worker ran it, to make room
+     * for a more valuable task when its memory budget was full (quicxd 2.1
+     * with {@code admission = value}). The task was not run; send it again
+     * later if it still matters.
+     */
+    public boolean isEvicted() {
+        return EVICTED.equals(failureReason);
+    }
+
+    /** The reason quicxd gives an evicted task. */
+    static final String EVICTED = "evicted";
+
+    /** The worker's reason (at most 63 bytes), if it reported FAILED, or "evicted". */
     public Optional<String> failureReason() {
         return Optional.ofNullable(failureReason);
     }
 
     @Override
     public String toString() {
-        return isDone() ? "TaskResult{" + taskId + " done}" : "TaskResult{" + taskId + " failed: " + failureReason + "}";
+        if (isDone()) return "TaskResult{" + taskId + " done}";
+        if (isEvicted()) return "TaskResult{" + taskId + " evicted}";
+        return "TaskResult{" + taskId + " failed: " + failureReason + "}";
     }
 }

@@ -41,6 +41,36 @@ class QxpTest {
     }
 
     @Test
+    void valuedSubmitBodyPutsTheLevelFirst() {
+        byte[] body = Qxp.valuedSubmitBody(12, "mail", "hi".getBytes(StandardCharsets.UTF_8), Qxp.MAX_BODY);
+        assertArrayEquals(new byte[] {12, 4, 'm', 'a', 'i', 'l', 'h', 'i'}, body);
+        assertEquals(0x0D, Qxp.SUBMIT_VALUED);
+    }
+
+    @Test
+    void levelsAreZeroToFifteen() {
+        assertEquals(0, Qxp.valuedSubmitBody(0, "a", null, Qxp.MAX_BODY)[0]);
+        assertEquals(15, Qxp.valuedSubmitBody(15, "a", null, Qxp.MAX_BODY)[0]);
+        assertThrows(IllegalArgumentException.class, () -> Qxp.valuedSubmitBody(-1, "a", null, Qxp.MAX_BODY));
+        assertThrows(IllegalArgumentException.class, () -> Qxp.valuedSubmitBody(16, "a", null, Qxp.MAX_BODY));
+    }
+
+    @Test
+    void theLevelByteCountsTowardTheLimit() {
+        String type = "mail";
+        int max = Qxp.MAX_BODY - 2 - type.length();
+        assertEquals(Qxp.MAX_BODY, Qxp.valuedSubmitBody(1, type, new byte[max], Qxp.MAX_BODY).length);
+        assertThrows(IllegalArgumentException.class, () -> Qxp.valuedSubmitBody(1, type, new byte[max + 1], Qxp.MAX_BODY));
+    }
+
+    @Test
+    void aBiggerDaemonTakesBiggerBodies() {
+        assertThrows(IllegalArgumentException.class, () -> Qxp.submitBody("img", new byte[8000]));
+        assertEquals(8004, Qxp.submitBody("img", new byte[8000], 8192).length);
+        assertEquals(8005, Qxp.valuedSubmitBody(3, "img", new byte[8000], 8192).length);
+    }
+
+    @Test
     void taskTypeLimits() {
         assertEquals(31, Qxp.typeBytes("a".repeat(31)).length);
         assertThrows(IllegalArgumentException.class, () -> Qxp.typeBytes("a".repeat(32)));

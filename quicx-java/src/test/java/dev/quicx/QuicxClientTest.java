@@ -47,6 +47,87 @@ class QuicxClientTest {
     }
 
     @Test
+    void aValuedSubmitSendsSubmitValuedWithTheLevel() throws Exception {
+        try (FakeDaemon d = new FakeDaemon(p -> {
+                 Frame f = p.read();
+                 assertEquals(Qxp.SUBMIT_VALUED, f.type);
+                 assertArrayEquals(Qxp.valuedSubmitBody(12, "frame", "f1".getBytes(StandardCharsets.UTF_8), Qxp.MAX_BODY), f.body);
+                 p.ok(5);
+                 f = p.read();
+                 assertEquals(Qxp.SUBMIT, f.type);   // no level: a plain SUBMIT, level 8 in quicxd
+                 p.ok(6);
+                 p.awaitClose();
+             });
+             QuicxClient c = new QuicxClient("127.0.0.1", d.port())) {
+            assertEquals(5, c.submit("frame", "f1", 12));
+            assertEquals(6, c.submit("frame", "f2"));
+            assertTrue(d.errors.isEmpty(), d.errors.toString());
+        }
+    }
+
+    @Test
+    void aLevelOutsideZeroToFifteenIsRefusedBeforeSending() throws Exception {
+        try (FakeDaemon d = new FakeDaemon(FakeDaemon.Peer::awaitClose);
+             QuicxClient c = new QuicxClient("127.0.0.1", d.port())) {
+            assertThrows(IllegalArgumentException.class, () -> c.submit("a", "x", 16));
+            assertThrows(IllegalArgumentException.class, () -> c.submitAsync("a", "x", -1));
+            Thread.sleep(100);
+            assertEquals(0, d.peers.size(), "nothing should have been sent");
+        }
+    }
+
+    @Test
+    void anEvictedTaskEndsWithAnEvictedResult() throws Exception {
+        try (FakeDaemon d = new FakeDaemon(p -> {
+                 p.read();
+                 p.ok(9);
+                 p.failed(9, "evicted");   // quicxd made room for a more valuable task
+                 p.awaitClose();
+             });
+             QuicxClient c = new QuicxClient("127.0.0.1", d.port())) {
+            TaskResult r = c.submitAsync("frame", "f", 2).get(5, TimeUnit.SECONDS);
+            assertTrue(r.isEvicted());
+            assertTrue(r.isFailed());
+            assertEquals("evicted", r.failureReason().get());
+            assertEquals("TaskResult{9 evicted}", r.toString());
+        }
+    }
+
+    @Test
+    void aWorkerFailureIsNotAnEviction() throws Exception {
+        try (FakeDaemon d = new FakeDaemon(p -> {
+                 p.read();
+                 p.ok(3);
+                 p.failed(3, "disk full");
+                 p.awaitClose();
+             });
+             QuicxClient c = new QuicxClient("127.0.0.1", d.port())) {
+            TaskResult r = c.submitAsync("job", "x").get(5, TimeUnit.SECONDS);
+            assertTrue(r.isFailed());
+            assertFalse(r.isEvicted());
+        }
+    }
+
+    @Test
+    void maxBodyMatchesADaemonBuiltForBiggerTasks() throws Exception {
+        try (FakeDaemon d = new FakeDaemon(p -> {
+                 Frame f = p.read();
+                 assertEquals(1 + 3 + 8000, f.body.length);
+                 p.ok(1);
+                 p.awaitClose();
+             });
+             QuicxClient big = QuicxClient.builder().host("127.0.0.1").port(d.port()).maxBody(8192).build();
+             QuicxClient normal = new QuicxClient("127.0.0.1", d.port())) {
+            assertThrows(IllegalArgumentException.class, () -> normal.submit("img", new byte[8000]));
+            assertEquals(1, big.submit("img", new byte[8000]));
+            assertEquals(8192, big.maxBody());
+            assertEquals(1024, normal.maxBody());
+            assertThrows(IllegalArgumentException.class, () -> QuicxClient.builder().maxBody(20_000));
+            assertTrue(d.errors.isEmpty(), d.errors.toString());
+        }
+    }
+
+    @Test
     void aFullQueueIsARejection() throws Exception {
         try (FakeDaemon d = new FakeDaemon(p -> {
                  p.read();
